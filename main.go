@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -20,6 +21,7 @@ var (
 	upToDateStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	pathStyle     = lipgloss.NewStyle().Bold(true)
+	statStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 // --- Messages ---
@@ -27,17 +29,20 @@ type scanDoneMsg []string
 type pullResultMsg struct {
 	path    string
 	changes bool
+	commits int
 	err     error
 }
 
 // --- Model ---
 type model struct {
-	repos    []string
-	results  []pullResultMsg
-	index    int
-	spinner  spinner.Model
-	scanning bool
-	done     bool
+	repos        []string
+	results      []pullResultMsg
+	completed    int
+	updatedCount int
+	totalCommits int
+	spinner      spinner.Model
+	scanning     bool
+	done         bool
 }
 
 func initialModel() model {
@@ -60,6 +65,7 @@ func (m model) Init() tea.Cmd {
 }
 
 // --- Commands ---
+
 // scanSubdirsCmd looks for subdirectories containing a .git folder.
 func scanSubdirsCmd() tea.Cmd {
 	return func() tea.Msg {
@@ -83,13 +89,26 @@ func scanSubdirsCmd() tea.Cmd {
 	}
 }
 
-// pullRepoCmd runs `git pull` in the specified directory.
+// getHEAD is a helper to get the current commit hash
+func getHEAD(dir string) string {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// pullRepoCmd runs `git pull --all` in the specified directory asynchronously.
 func pullRepoCmd(path string) tea.Cmd {
 	return func() tea.Msg {
-		cmd := exec.Command("git", "pull")
+		beforeHash := getHEAD(path)
+
+		// git pull --all fetches all remotes and pulls the tracking branch
+		cmd := exec.Command("git", "pull", "--all")
 		cmd.Dir = path
-		
-		// Prevent git/ssh from hanging while waiting for user input
+
 		cmd.Env = append(os.Environ(),
 			"GIT_TERMINAL_PROMPT=0",
 			"GIT_SSH_COMMAND=ssh -o BatchMode=yes",
@@ -100,22 +119,19 @@ func pullRepoCmd(path string) tea.Cmd {
 
 		if err != nil {
 			cleanErr := strings.TrimSpace(outStr)
-			
-			// Detect authentication failures
-			if strings.Contains(cleanErr, "could not read Username") || 
-			   strings.Contains(cleanErr, "Permission denied") || 
-			   strings.Contains(cleanErr, "Authentication failed") || 
-			   strings.Contains(cleanErr, "Host key verification failed") {
+
+			if strings.Contains(cleanErr, "could not read Username") ||
+				strings.Contains(cleanErr, "Permission denied") ||
+				strings.Contains(cleanErr, "Authentication failed") ||
+				strings.Contains(cleanErr, "Host key verification failed") {
 				cleanErr = "Authentication required (skipped)"
 			} else if cleanErr == "" {
 				cleanErr = err.Error()
 			} else {
-				// Convert multiline errors into a single line
 				cleanErr = strings.ReplaceAll(cleanErr, "\r\n", " | ")
 				cleanErr = strings.ReplaceAll(cleanErr, "\n", " | ")
 			}
 
-			// Truncate to ensure it fits nicely on a standard terminal line
 			if len(cleanErr) > 65 {
 				cleanErr = cleanErr[:62] + "..."
 			}
@@ -127,12 +143,26 @@ func pullRepoCmd(path string) tea.Cmd {
 			}
 		}
 
-		// Detect if changes were actually pulled
-		changes := !strings.Contains(outStr, "Already up to date")
+		afterHash := getHEAD(path)
+		commits := 0
+		changes := false
+
+		// Calculate if HEAD advanced to count commits
+		if beforeHash != "" && afterHash != "" && beforeHash != afterHash {
+			changes = true
+			countCmd := exec.Command("git", "rev-list", "--count", beforeHash+".."+afterHash)
+			countCmd.Dir = path
+			countOut, _ := countCmd.Output()
+			commits, _ = strconv.Atoi(strings.TrimSpace(string(countOut)))
+		} else if !strings.Contains(outStr, "Already up to date") {
+			// Catch-all for when other branches were fetched but HEAD didn't advance
+			changes = true
+		}
 
 		return pullResultMsg{
 			path:    path,
 			changes: changes,
+			commits: commits,
 			err:     nil,
 		}
 	}
@@ -141,7 +171,7 @@ func pullRepoCmd(path string) tea.Cmd {
 // --- Update ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
@@ -155,18 +185,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.done = true
 			return m, tea.Quit
 		}
-		return m, pullRepoCmd(m.repos[m.index])
+
+		// Dispatch ALL git pull commands at once using tea.Batch
+		var cmds []tea.Cmd
+		for _, repo := range m.repos {
+			cmds = append(cmds, pullRepoCmd(repo))
+		}
+		return m, tea.Batch(cmds...)
 
 	case pullResultMsg:
 		m.results = append(m.results, msg)
-		m.index++
+		m.completed++
 
-		if m.index < len(m.repos) {
-			return m, pullRepoCmd(m.repos[m.index])
+		if msg.changes {
+			m.updatedCount++
+			m.totalCommits += msg.commits
 		}
 
-		m.done = true
-		return m, tea.Quit
+		// Check if all goroutines have returned
+		if m.completed == len(m.repos) {
+			m.done = true
+			return m, tea.Quit
+		}
+		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -181,29 +222,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var sb strings.Builder
 
+	// 1. Render Completed Results (appearing as they finish)
 	for _, res := range m.results {
 		name := pathStyle.Render(res.path)
 		if res.err != nil {
 			sb.WriteString(fmt.Sprintf("%s %s: %s\n", errorStyle.Render("✗"), name, errorStyle.Render(res.err.Error())))
 		} else if res.changes {
-			sb.WriteString(fmt.Sprintf("%s %s: %s\n", successStyle.Render("✓"), name, successStyle.Render("Changes pulled")))
+			commitText := "Changes pulled"
+			if res.commits > 0 {
+				commitText = fmt.Sprintf("Pulled %d commit(s)", res.commits)
+			} else {
+				commitText = "Fetched remote branches"
+			}
+			sb.WriteString(fmt.Sprintf("%s %s: %s\n", successStyle.Render("✓"), name, successStyle.Render(commitText)))
 		} else {
 			sb.WriteString(fmt.Sprintf("%s %s: %s\n", upToDateStyle.Render("-"), name, upToDateStyle.Render("Already up to date")))
 		}
 	}
 
+	// 2. Render Current State & Summary
 	if m.done {
 		if len(m.repos) == 0 {
 			sb.WriteString("\nNo git repositories found in subdirectories.\n")
 		} else {
-			sb.WriteString(progressStyle.Render(fmt.Sprintf("\nFinished updating %d repositories.\n", len(m.repos))))
+			summary := fmt.Sprintf("\nFinished scanning %d repositories. %s updated ", len(m.repos), statStyle.Render(strconv.Itoa(m.updatedCount)))
+			if m.updatedCount > 0 {
+				summary += fmt.Sprintf("(%s total commits pulled).\n", statStyle.Render(strconv.Itoa(m.totalCommits)))
+			} else {
+				summary += ".\n"
+			}
+			sb.WriteString(progressStyle.Render(summary))
 		}
 	} else if m.scanning {
 		sb.WriteString(fmt.Sprintf("%s Scanning subdirectories for git repositories...\n", m.spinner.View()))
 	} else {
-		progressText := fmt.Sprintf("(%d/%d)", m.index+1, len(m.repos))
-		currentRepo := m.repos[m.index]
-		sb.WriteString(fmt.Sprintf("%s Updating %s %s...\n", m.spinner.View(), pathStyle.Render(currentRepo), progressStyle.Render(progressText)))
+		// Active parallel progress
+		progressText := fmt.Sprintf("(%d/%d)", m.completed, len(m.repos))
+		sb.WriteString(fmt.Sprintf("%s Updating repositories in parallel %s...\n", m.spinner.View(), progressStyle.Render(progressText)))
 	}
 
 	if !m.done {
