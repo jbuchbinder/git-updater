@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -139,7 +140,7 @@ func pullRepoCmd(path string) tea.Cmd {
 			return pullResultMsg{
 				path:    path,
 				changes: false,
-				err:     fmt.Errorf(cleanErr),
+				err:     errors.New(cleanErr),
 			}
 		}
 
@@ -226,17 +227,17 @@ func (m model) View() string {
 	for _, res := range m.results {
 		name := pathStyle.Render(res.path)
 		if res.err != nil {
-			sb.WriteString(fmt.Sprintf("%s %s: %s\n", errorStyle.Render("✗"), name, errorStyle.Render(res.err.Error())))
+			fmt.Fprintf(&sb, "%s %s: %s\n", errorStyle.Render("✗"), name, errorStyle.Render(res.err.Error()))
 		} else if res.changes {
-			commitText := "Changes pulled"
+			var commitText string
 			if res.commits > 0 {
 				commitText = fmt.Sprintf("Pulled %d commit(s)", res.commits)
 			} else {
 				commitText = "Fetched remote branches"
 			}
-			sb.WriteString(fmt.Sprintf("%s %s: %s\n", successStyle.Render("✓"), name, successStyle.Render(commitText)))
+			fmt.Fprintf(&sb, "%s %s: %s\n", successStyle.Render("✓"), name, successStyle.Render(commitText))
 		} else {
-			sb.WriteString(fmt.Sprintf("%s %s: %s\n", upToDateStyle.Render("-"), name, upToDateStyle.Render("Already up to date")))
+			fmt.Fprintf(&sb, "%s %s: %s\n", upToDateStyle.Render("-"), name, upToDateStyle.Render("Already up to date"))
 		}
 	}
 
@@ -254,11 +255,11 @@ func (m model) View() string {
 			sb.WriteString(progressStyle.Render(summary))
 		}
 	} else if m.scanning {
-		sb.WriteString(fmt.Sprintf("%s Scanning subdirectories for git repositories...\n", m.spinner.View()))
+		fmt.Fprintf(&sb, "%s Scanning subdirectories for git repositories...\n", m.spinner.View())
 	} else {
 		// Active parallel progress
 		progressText := fmt.Sprintf("(%d/%d)", m.completed, len(m.repos))
-		sb.WriteString(fmt.Sprintf("%s Updating repositories in parallel %s...\n", m.spinner.View(), progressStyle.Render(progressText)))
+		fmt.Fprintf(&sb, "%s Updating repositories in parallel %s...\n", m.spinner.View(), progressStyle.Render(progressText))
 	}
 
 	if !m.done {
