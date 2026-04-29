@@ -106,7 +106,7 @@ func pullRepoCmd(path string) tea.Cmd {
 		beforeHash := getHEAD(path)
 
 		// git pull --all fetches all remotes and pulls the tracking branch
-		cmd := exec.Command("git", "pull", "--all")
+		cmd := exec.Command("git", "pull", "--all", "--tags")
 		cmd.Dir = path
 
 		cmd.Env = append(os.Environ(),
