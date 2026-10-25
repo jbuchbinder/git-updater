@@ -101,13 +101,29 @@ func getHEAD(dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// truncateErr squeezes a one-line git error into the narrow result column.
+// Both ends are kept: the head usually names the operation and the tail
+// usually carries the actual reason.
+func truncateErr(s string) string {
+	const limit, head, tail = 65, 32, 30
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return string(r[:head]) + "..." + string(r[len(r)-tail:])
+}
+
 // pullRepoCmd runs `git pull --all` in the specified directory asynchronously.
 func pullRepoCmd(path string) tea.Cmd {
 	return func() tea.Msg {
 		beforeHash := getHEAD(path)
 
-		// git pull --all fetches all remotes and pulls the tracking branch
-		cmd := exec.Command("git", "pull", "--all", "--tags")
+		// git pull --all fetches all remotes and pulls the tracking branch.
+		// --force is required: without it, a tag that moved upstream (or was
+		// rewritten) makes fetch abort with "would clobber existing tag". Fetch
+		// failing means the merge never runs, so the repo silently stays behind
+		// forever. With --force the moved tag is updated and the pull proceeds.
+		cmd := exec.Command("git", "pull", "--all", "--tags", "--force")
 		cmd.Dir = path
 
 		cmd.Env = append(os.Environ(),
@@ -129,12 +145,9 @@ func pullRepoCmd(path string) tea.Cmd {
 			} else if cleanErr == "" {
 				cleanErr = err.Error()
 			} else {
-				cleanErr = strings.ReplaceAll(cleanErr, "\r\n", " | ")
-				cleanErr = strings.ReplaceAll(cleanErr, "\n", " | ")
-			}
-
-			if len(cleanErr) > 65 {
-				cleanErr = cleanErr[:62] + "..."
+				// Collapse git's multi-line, column-aligned output into one line
+				// so the truncation below keeps the reason instead of padding.
+				cleanErr = truncateErr(strings.Join(strings.Fields(cleanErr), " "))
 			}
 
 			return pullResultMsg{
